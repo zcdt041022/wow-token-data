@@ -1,0 +1,26 @@
+name: 时光徽章价格定时抓取
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: 抓取 + 合并 + 聚合
+        run: node .github/scripts/fetch-token.js
+      - name: 提交数据到仓库
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add token-data/hourly.json token-data/daily.json
+          git diff --cached --stat
+          git commit -m "auto: token prices $(date -u '+%Y-%m-%d %H:%M UTC')" || echo "no changes"
+          git push
