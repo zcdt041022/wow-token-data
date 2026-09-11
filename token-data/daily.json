@@ -1,0 +1,16 @@
+{
+  "official": {
+    "labels": [
+      "1789084800"
+    ],
+    "prices": [
+      644475
+    ]
+  },
+  "classic": {
+    "labels": [],
+    "prices": []
+  },
+  "granularity": "daily",
+  "updated_at": "2026-09-11T10:58:27.007Z"
+}
