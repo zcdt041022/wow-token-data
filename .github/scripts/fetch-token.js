@@ -87,8 +87,18 @@ async function fetchOfficial() {
     return null;
   }
 
-  // 取 fetched_at_ms 最新的那个
-  results.sort((a, b) => b.ts - a.ts);
+  // 固定优先级: wowdata > chuanghan
+  // 理由: chuanghan.top 是插件收集数据, 有约 40 分钟滞后; 它的 latest_time
+  //       字段是 API 响应时间而非数据时间, 不能用 ts 排序判断新鲜度。
+  //       wowdata.top 接近实时, 与官方价格一致, 应优先采用。
+  const PRIORITY = ["wowdata", "chuanghan"];
+  for (const src of PRIORITY) {
+    const hit = results.find((r) => r.source === src);
+    if (hit) {
+      console.log(`  [selected] 正式服 选用 ${src} price=${hit.price}`);
+      return hit;
+    }
+  }
   return results[0];
 }
 
@@ -157,7 +167,17 @@ async function fetchClassic() {
     return null;
   }
 
-  results.sort((a, b) => b.ts - a.ts);
+  // 固定优先级: jiguanqiang > wowdata
+  // 理由: wowdata.top 怀旧服价格更新频率极低(几乎静态), jiguanqiang 相对更可信。
+  //       不按 ts 排序, 因为两个源的 ts 都是 NOW_SEC 无法区分。
+  const PRIORITY = ["jiguanqiang", "wowdata"];
+  for (const src of PRIORITY) {
+    const hit = results.find((r) => r.source === src);
+    if (hit) {
+      console.log(`  [selected] 怀旧服 选用 ${src} price=${hit.price}`);
+      return hit;
+    }
+  }
   return results[0];
 }
 
