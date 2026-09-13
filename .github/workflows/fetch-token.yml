@@ -28,4 +28,6 @@ jobs:
           git add token-data/hourly.json token-data/daily.json
           git diff --cached --stat
           git commit -m "auto: token prices $(date -u '+%Y-%m-%d %H:%M UTC')" || echo "no changes"
+          # 防止并发 workflow 推送冲突: 先 rebase 拉取远端最新, 冲突时放弃本地提交(下次运行会补齐)
+          git pull --rebase origin main || { echo "rebase conflict, aborting"; git rebase --abort; exit 0; }
           git push
