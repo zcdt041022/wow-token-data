@@ -16,9 +16,13 @@
     ]
   },
   "classic": {
-    "labels": [],
-    "prices": []
+    "labels": [
+      "1789430400"
+    ],
+    "prices": [
+      481296
+    ]
   },
   "granularity": "daily",
-  "updated_at": "2026-09-15T07:38:35.925Z"
+  "updated_at": "2026-09-15T07:41:24.408Z"
 }
