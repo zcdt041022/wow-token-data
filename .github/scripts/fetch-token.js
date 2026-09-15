@@ -102,84 +102,10 @@ async function fetchOfficial() {
   return results[0];
 }
 
-// ── 第 1b 步: 尝试抓取怀旧服价格(尽力而为, 失败跳过) ─────────
-
-async function fetchClassic() {
-  const results = [];
-
-  // 源 1: wowdata.top 怀旧服页面
-  try {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 10000);
-    const res = await fetch("https://wowdata.top/wowtoken_classic", {
-      headers: { "User-Agent": UA },
-      signal: ctrl.signal,
-    });
-    clearTimeout(timer);
-    if (res.ok) {
-      const html = await res.text();
-      const m = html.match(/(\d{2,3}),(\d{3})/);
-      if (m) {
-        const price = parseInt(m[1] + m[2], 10);
-        if (price > 50000 && price < 500000) {
-          console.log(`  [wowdata] 怀旧服 price=${price} ts=${NOW_SEC}`);
-          results.push({ price, ts: NOW_SEC, source: "wowdata" });
-        } else {
-          console.log(`  [wowdata] 怀旧服 price=${price} 异常范围, 跳过`);
-        }
-      } else {
-        console.log(`  [wowdata] 怀旧服 未匹配到价格`);
-      }
-    }
-  } catch (e) {
-    console.log(`  [wowdata] 怀旧服 失败: ${e.message}`);
-  }
-
-  // 源 2: jiguanqiang.net (尝试一下, 可能已改版)
-  try {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 10000);
-    const res = await fetch("https://wow.jiguanqiang.net/", {
-      headers: { "User-Agent": UA, "Referer": "https://wow.jiguanqiang.net/" },
-      signal: ctrl.signal,
-    });
-    clearTimeout(timer);
-    if (res.ok) {
-      const html = await res.text();
-      // 尝试找"熊猫人之谜"或"怀旧"附近的数字
-      const keywordHit = html.match(/(熊猫人之谜|怀旧服)[^<]*?(\d{6})/);
-      if (keywordHit) {
-        const price = parseInt(keywordHit[2], 10);
-        if (price > 50000) {
-          console.log(`  [jiguanqiang] 怀旧服 price=${price} ts=${NOW_SEC}`);
-          results.push({ price, ts: NOW_SEC, source: "jiguanqiang" });
-        }
-      } else {
-        console.log(`  [jiguanqiang] 怀旧服 未匹配(可能已改版)`);
-      }
-    }
-  } catch (e) {
-    console.log(`  [jiguanqiang] 怀旧服 失败: ${e.message}`);
-  }
-
-  if (results.length === 0) {
-    console.log("  ⚠️ 所有怀旧服数据源均失败(可忽略, 柠屿软件本地会补)");
-    return null;
-  }
-
-  // 固定优先级: jiguanqiang > wowdata
-  // 理由: wowdata.top 怀旧服价格更新频率极低(几乎静态), jiguanqiang 相对更可信。
-  //       不按 ts 排序, 因为两个源的 ts 都是 NOW_SEC 无法区分。
-  const PRIORITY = ["jiguanqiang", "wowdata"];
-  for (const src of PRIORITY) {
-    const hit = results.find((r) => r.source === src);
-    if (hit) {
-      console.log(`  [selected] 怀旧服 选用 ${src} price=${hit.price}`);
-      return hit;
-    }
-  }
-  return results[0];
-}
+// ── 第 1b 步: 怀旧服价格 ────────────────────────────────────────
+// 怀旧服数据完全依赖柠屿软件本地从 jiguanqiang.net 累积,
+// GitHub Actions 不参与抓取(一是 jiguanqiang 反爬, 二是数据质量无保证)。
+// hourly.json classic 保持空, 柠屿启动后 Rust 端会从本地历史构建曲线。
 
 // ── 第 2 步: 加载现有 hourly.json ──────────────────────────────
 
@@ -318,9 +244,7 @@ function buildDailyFromHourly(hourly) {
   console.log("抓取正式服价格...");
   const officialPoint = await fetchOfficial();
 
-  // 1b. 抓怀旧服(尽力而为, 失败跳过)
-  console.log("\n抓取怀旧服价格...");
-  const classicPoint = await fetchClassic();
+  // 怀旧服: 不在这里抓, 柠屿软件本地从 jiguanqiang 累积
 
   // 2. 加载现有 hourly.json
   console.log("\n加载现有 hourly.json...");
@@ -333,11 +257,11 @@ function buildDailyFromHourly(hourly) {
     console.log("  hourly.json 不存在, 将创建新文件");
   }
 
-  // 3. 合并到 hourly
+  // 3. 合并到 hourly(只合并正式服, 怀旧服保持原样)
   console.log("\n合并到 hourly.json...");
   let hourly = existingHourly;
   hourly = mergeIntoHourly(hourly, officialPoint, "official");
-  hourly = mergeIntoHourly(hourly, classicPoint, "classic");
+  // classic 不 merge, 保持 hourly.json 里原有的 classic 数据(如果有的话)
 
   // 4. 从 hourly 聚合 daily
   console.log("\n聚合 daily.json...");
