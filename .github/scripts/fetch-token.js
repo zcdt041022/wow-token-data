@@ -102,10 +102,86 @@ async function fetchOfficial() {
   return results[0];
 }
 
-// ── 第 1b 步: 怀旧服价格 ────────────────────────────────────────
-// 怀旧服数据完全依赖柠屿软件本地从 jiguanqiang.net 累积,
-// GitHub Actions 不参与抓取(一是 jiguanqiang 反爬, 二是数据质量无保证)。
-// hourly.json classic 保持空, 柠屿启动后 Rust 端会从本地历史构建曲线。
+// ── 第 1b 步: 从 jiguanqiang.net 同时抓正式服 + 怀旧服价格 ──────
+// 页面 HTML 结构(按 token5 div 分块):
+//   <div class="token5">
+//     <div class="top">国服·地心之战</div>
+//     <div class="middle"> 614462 <img ...></div>
+//     <div class="bottom">更新于：2 分 47 秒前</div>
+//   </div>
+//   <div class="token5">
+//     <div class="top">国服·熊猫人之谜</div>
+//     <div class="middle"> 436863 <img ...></div>
+//     <div class="bottom">更新于：2 分 47 秒前</div>
+//   </div>
+async function fetchJqSnapshot() {
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 10000);
+    const res = await fetch("https://wow.jiguanqiang.net/", {
+      headers: {
+        "User-Agent": UA,
+        "Referer": "https://wow.jiguanqiang.net/",
+      },
+      signal: ctrl.signal,
+    });
+    clearTimeout(timer);
+    if (!res.ok) {
+      console.log(`  [jiguanqiang] HTTP ${res.status}, 跳过`);
+      return {};
+    }
+    const html = await res.text();
+
+    // 按 token5 div 分块
+    const TOKEN_TAG = '<div class="token5">';
+    const prices = {}; // { official: 614462, classic: 436863 }
+    let searchFrom = 0;
+    let idx = 0;
+    while (true) {
+      const rel = html.toLowerCase().indexOf(TOKEN_TAG, searchFrom);
+      if (rel === -1) break;
+      const blockStart = searchFrom + rel;
+      const next = html.toLowerCase().indexOf(TOKEN_TAG, blockStart + TOKEN_TAG.length);
+      const blockEnd = next === -1 ? html.length : searchFrom + next;
+      const block = html.slice(blockStart, blockEnd);
+
+      // 去掉 HTML 标签, 得到纯文本
+      const text = block.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+
+      let role = null;
+      if (text.includes("国服") && text.includes("地心之战")) {
+        role = "official";
+      } else if (text.includes("国服") && (text.includes("熊猫人之谜") || text.includes("怀旧"))) {
+        role = "classic";
+      }
+
+      if (role) {
+        // 文本里第一个 5-6 位数就是价格
+        const m = text.match(/\b(\d{5,6})\b/);
+        if (m) {
+          prices[role] = parseInt(m[1], 10);
+          console.log(`  [jiguanqiang] ${role} price=${prices[role]} ts=${NOW_SEC} (块${idx})`);
+        } else {
+          console.log(`  [jiguanqiang] ${role} 块未找到价格, 文本="${text.slice(0, 60)}..."`);
+        }
+      } else {
+        console.log(`  [jiguanqiang] 块${idx} 非目标服务器, 文本="${text.slice(0, 60)}..."`);
+      }
+      searchFrom = blockEnd;
+      idx++;
+    }
+
+    if (Object.keys(prices).length === 0) {
+      console.log("  [jiguanqiang] 未匹配到任何时光徽章价格");
+    } else {
+      console.log(`  [jiguanqiang] 共抓到 ${Object.keys(prices).length} 个服:`, prices);
+    }
+    return prices;
+  } catch (e) {
+    console.log(`  [jiguanqiang] 失败: ${e.message}`);
+    return {};
+  }
+}
 
 // ── 第 2 步: 加载现有 hourly.json ──────────────────────────────
 
@@ -240,13 +316,25 @@ function buildDailyFromHourly(hourly) {
 (async () => {
   console.log(`\n=== 时光徽章定时抓取 ${new Date(NOW_MS).toISOString()} ===\n`);
 
-  // 1. 抓正式服
-  console.log("抓取正式服价格...");
-  const officialPoint = await fetchOfficial();
+  // 1. 先抓 jiguanqiang(同时覆盖正式服+怀旧服两个服, 数据最实时)
+  console.log("从 jiguanqiang.net 抓时光徽章价格...");
+  const jqPrices = await fetchJqSnapshot();
 
-  // 怀旧服: 不在这里抓, 柠屿软件本地从 jiguanqiang 累积
+  // 2. 抓正式服备用(chuanghan / wowdata, jiguanqiang 已有则跳过)
+  let officialPoint = null;
+  if (jqPrices.official) {
+    console.log(`  jiguanqiang 已有正式服 ${jqPrices.official}, 跳过 chuanghan/wowdata`);
+    officialPoint = { price: jqPrices.official, ts: NOW_SEC, source: "jiguanqiang" };
+  } else {
+    console.log("  jiguanqiang 未抓到正式服, 回退 chuanghan/wowdata...");
+    officialPoint = await fetchOfficial();
+  }
 
-  // 2. 加载现有 hourly.json
+  const classicPoint = jqPrices.classic
+    ? { price: jqPrices.classic, ts: NOW_SEC, source: "jiguanqiang" }
+    : null;
+
+  // 3. 加载现有 hourly.json
   console.log("\n加载现有 hourly.json...");
   const existingHourly = loadJson(HOURLY_PATH);
   const existingDaily = loadJson(DAILY_PATH);
@@ -257,11 +345,11 @@ function buildDailyFromHourly(hourly) {
     console.log("  hourly.json 不存在, 将创建新文件");
   }
 
-  // 3. 合并到 hourly(只合并正式服, 怀旧服保持原样)
+  // 4. 合并到 hourly
   console.log("\n合并到 hourly.json...");
   let hourly = existingHourly;
   hourly = mergeIntoHourly(hourly, officialPoint, "official");
-  // classic 不 merge, 保持 hourly.json 里原有的 classic 数据(如果有的话)
+  hourly = mergeIntoHourly(hourly, classicPoint, "classic");
 
   // 4. 从 hourly 聚合 daily
   console.log("\n聚合 daily.json...");
