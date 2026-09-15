@@ -132,17 +132,19 @@ async function fetchJqSnapshot() {
     }
     const html = await res.text();
 
-    // 按 token5 div 分块
-    const TOKEN_TAG = '<div class="token5">';
-    const prices = {}; // { official: 614462, classic: 436863 }
-    let searchFrom = 0;
-    let idx = 0;
-    while (true) {
-      const rel = html.toLowerCase().indexOf(TOKEN_TAG, searchFrom);
-      if (rel === -1) break;
-      const blockStart = searchFrom + rel;
-      const next = html.toLowerCase().indexOf(TOKEN_TAG, blockStart + TOKEN_TAG.length);
-      const blockEnd = next === -1 ? html.length : searchFrom + next;
+    // 按 token5 div 分块(正则匹配, 兼容不同引号/空格/缩进)
+    const token5Re = /<div[^>]*class\s*=\s*['"]([^'"]*token5[^'"]*)['"][^>]*>/gi;
+    const tagPositions = [];
+    let m;
+    while ((m = token5Re.exec(html)) !== null) {
+      tagPositions.push({ start: m.index, end: m.index + m[0].length });
+    }
+    console.log(`  [jiguanqiang] 找到 ${tagPositions.length} 个 token5 div`);
+
+    const prices = {}; // { official: 561323, classic: 476767 }
+    for (let i = 0; i < tagPositions.length; i++) {
+      const blockStart = tagPositions[i].start;
+      const blockEnd = i + 1 < tagPositions.length ? tagPositions[i + 1].start : html.length;
       const block = html.slice(blockStart, blockEnd);
 
       // 去掉 HTML 标签, 得到纯文本
@@ -157,18 +159,16 @@ async function fetchJqSnapshot() {
 
       if (role) {
         // 文本里第一个 5-6 位数就是价格
-        const m = text.match(/\b(\d{5,6})\b/);
-        if (m) {
-          prices[role] = parseInt(m[1], 10);
-          console.log(`  [jiguanqiang] ${role} price=${prices[role]} ts=${NOW_SEC} (块${idx})`);
+        const priceMatch = text.match(/\b(\d{5,6})\b/);
+        if (priceMatch) {
+          prices[role] = parseInt(priceMatch[1], 10);
+          console.log(`  [jiguanqiang] ${role} price=${prices[role]} ts=${NOW_SEC} (块${i})`);
         } else {
-          console.log(`  [jiguanqiang] ${role} 块未找到价格, 文本="${text.slice(0, 60)}..."`);
+          console.log(`  [jiguanqiang] ${role} 块未找到价格, 文本="${text.slice(0, 80)}..."`);
         }
       } else {
-        console.log(`  [jiguanqiang] 块${idx} 非目标服务器, 文本="${text.slice(0, 60)}..."`);
+        console.log(`  [jiguanqiang] 块${i} 非目标服务器, 文本="${text.slice(0, 80)}..."`);
       }
-      searchFrom = blockEnd;
-      idx++;
     }
 
     if (Object.keys(prices).length === 0) {
