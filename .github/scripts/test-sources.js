@@ -11,7 +11,7 @@ const SOURCES = [
   },
   {
     name: "jiguanqiang.net 首页",
-    url: "https://jiguanqiang.net",
+    url: "https://wow.jiguanqiang.net/",
   },
   {
     name: "wowdata.top 正式服",
