@@ -17,6 +17,7 @@
 
 const fs = require("fs");
 const path = require("path");
+const { spawnSync } = require("child_process");
 
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
@@ -209,6 +210,98 @@ function loadJson(filepath) {
 function saveJson(filepath, data) {
   fs.mkdirSync(path.dirname(filepath), { recursive: true });
   fs.writeFileSync(filepath, JSON.stringify(data, null, 2), "utf-8");
+}
+
+// ── 每轮采样后立即提交 ──────────────────────────────────────────
+// 一次运行要持续约 140 分钟, 若等到整轮结束才提交, 这 140 分钟内
+// 仓库和桌面端都读不到任何新数据。因此每完成一次采样就提交一次,
+// 让 20 分钟桶"边采边落"; 提交失败不吞掉, 由主循环计入失败次数。
+// 仅在 Actions 中生效(AUTO_COMMIT=1), 本地直接跑脚本不会碰 git。
+
+const AUTO_COMMIT = process.env.AUTO_COMMIT === "1";
+let gitIdentityReady = false;
+// 上一轮提交没能推上去时置 true, 下一轮即使没有新数据也会重试推送
+let pendingPush = false;
+
+function git(args) {
+  const r = spawnSync("git", args, { encoding: "utf-8" });
+  return {
+    ok: r.status === 0,
+    code: r.status,
+    err: (r.stderr || "").trim(),
+  };
+}
+
+function ensureIdentity() {
+  if (gitIdentityReady) return;
+  git(["config", "user.name", "github-actions[bot]"]);
+  git(["config", "user.email", "github-actions[bot]@users.noreply.github.com"]);
+  gitIdentityReady = true;
+}
+
+/**
+ * 提交本轮到手的部分并推送。
+ * 返回 { ok, committed }: ok=false 表示提交/同步/推送失败(已在日志里说明原因),
+ * 主循环据此把整次运行标红; 失败的提交会留在本地, 下一轮自动补推。
+ */
+function commitAndPush(sampleIdx, total) {
+  if (!AUTO_COMMIT) {
+    console.log("  [commit] 未设置 AUTO_COMMIT=1, 跳过提交(视为本地运行)");
+    return { ok: true, committed: false };
+  }
+  ensureIdentity();
+
+  const add = git(["add", "token-data/hourly.json", "token-data/daily.json"]);
+  if (!add.ok) {
+    console.error(`  [commit] git add 失败: ${add.err}`);
+    return { ok: false, committed: false };
+  }
+
+  // git diff --cached --quiet: 退出码 0 = 没有暂存改动, 1 = 有改动
+  const staged = git(["diff", "--cached", "--quiet"]);
+  if (staged.code !== 0 && staged.code !== 1) {
+    console.error(`  [commit] git diff 异常退出(${staged.code}): ${staged.err}`);
+    return { ok: false, committed: false };
+  }
+  let committed = false;
+  if (staged.code === 1) {
+    // 提交信息带采样序号与时间, 8 轮最多 8 条, 便于回溯
+    const msg = `auto: token sample ${sampleIdx}/${total} @ ${new Date().toISOString()}`;
+    const c = git(["commit", "-m", msg]);
+    if (!c.ok) {
+      console.error(`  [commit] git commit 失败: ${c.err}`);
+      return { ok: false, committed: false };
+    }
+    committed = true;
+    console.log(`  [commit] ✅ 已提交: ${msg}`);
+  } else if (!pendingPush) {
+    console.log("  [commit] 本轮无新数据, 不提交");
+    return { ok: true, committed: false };
+  }
+
+  // 用 fetch + rebase 而不是 pull, 在 detached HEAD 下同样可用
+  const fetched = git(["fetch", "origin", "main"]);
+  if (!fetched.ok) {
+    console.error(`  [commit] git fetch 失败: ${fetched.err}; 提交留在本地, 下一轮重试`);
+    pendingPush = true;
+    return { ok: false, committed };
+  }
+  const rebased = git(["rebase", "origin/main"]);
+  if (!rebased.ok) {
+    git(["rebase", "--abort"]);
+    console.error(`  [commit] rebase 失败: ${rebased.err}; 已回滚, 提交留在本地, 下一轮重试`);
+    pendingPush = true;
+    return { ok: false, committed };
+  }
+  const pushed = git(["push", "origin", "HEAD:main"]);
+  if (!pushed.ok) {
+    console.error(`  [commit] git push 失败: ${pushed.err}; 提交留在本地, 下一轮重试`);
+    pendingPush = true;
+    return { ok: false, committed };
+  }
+  pendingPush = false;
+  console.log("  [commit] ✅ 已推送到 origin/main");
+  return { ok: true, committed };
 }
 
 // ── 第 3 步: 合并价格到 hourly.json ────────────────────────────
@@ -441,6 +534,7 @@ function sleep(ms) {
 // GitHub 的 cron 在低活跃仓库上经常被延迟到数小时才触发, 单次采样会让
 // hourly.json 的 20 分钟桶出现大片空洞。这里让一次运行持续约 2.5 小时
 // (默认 8 次 × 20 分钟), 配合 workflow 的 concurrency 串行, 把缺口压到最小。
+// 每轮采样结束立即提交并推送(见 commitAndPush), 不必等整轮跑完才落盘。
 // 采样次数/间隔可用环境变量 SAMPLES / INTERVAL_SECONDS 调整。
 (async () => {
   const samples = Math.max(1, parseInt(process.env.SAMPLES || "8", 10));
@@ -449,22 +543,31 @@ function sleep(ms) {
 
   let okCount = 0;
   let failCount = 0;
+  let commitFailCount = 0;
   for (let i = 0; i < samples; i++) {
     console.log(`\n--- 采样 ${i + 1}/${samples} ---`);
     const r = await runOnce();
     if (r.ok) okCount++;
     else failCount++;
+    // 每轮采样后立即提交(失败轮次也会重试上次没推上去的提交),
+    // 让 20 分钟桶在 140 分钟的运行过程中就能被仓库/桌面端读到。
+    const cm = commitAndPush(i + 1, samples);
+    if (!cm.ok) commitFailCount++;
     if (i < samples - 1) {
       console.log(`等待 ${intervalSec} 秒后进行下一次采样...`);
       await sleep(intervalSec * 1000);
     }
   }
 
-  console.log(`\n=== 采样汇总: 成功 ${okCount}, 失败 ${failCount}, 共 ${samples} ===`);
-  // 任何一次采样没抓到数据都以非 0 退出, 让 Actions 显示为失败,
-  // 不再用 echo 之类把失败伪装成成功。
-  if (failCount > 0) {
-    console.error(`存在 ${failCount} 次采样未抓到数据, 本次运行标记为失败`);
+  console.log(
+    `\n=== 采样汇总: 成功 ${okCount}, 失败 ${failCount}, 提交/推送失败 ${commitFailCount}, 共 ${samples} ===`,
+  );
+  // 任何一次采样没抓到数据、或任何一次提交/推送失败, 都以非 0 退出,
+  // 让 Actions 显示为失败, 不把失败伪装成成功。
+  if (failCount > 0 || commitFailCount > 0) {
+    console.error(
+      `存在 ${failCount} 次采样未抓到数据, ${commitFailCount} 次提交/推送失败, 本次运行标记为失败`,
+    );
     process.exit(1);
   }
   console.log("全部采样完成\n");
