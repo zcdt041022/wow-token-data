@@ -1,16 +1,24 @@
 name: 时光徽章价格定时抓取
 
 on:
-  # 每 30 分钟自动跑一次
+  # 每 30 分钟触发一次。GitHub 的 schedule 在低活跃仓库上常被延迟
+  # (实测中位数约 3.5 小时), 因此补缺密度主要靠"单次运行内多次采样 +
+  # concurrency 串行"来兜底, 而不是指望 cron 准点。
   schedule:
     - cron: '*/30 * * * *'
   # 允许手动触发测试
   workflow_dispatch:
 
+# 同一时间只保留一个运行: 新触发的运行排队等待, 不打断正在进行的多采样运行。
+concurrency:
+  group: token-fetch
+  cancel-in-progress: false
+
 jobs:
   fetch:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # 8 次采样 × 20 分钟 ≈ 140 分钟, 留出网络与提交余量
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
 
@@ -18,16 +26,34 @@ jobs:
         with:
           node-version: '20'
 
-      - name: 抓取 + 合并 + 聚合
+      - name: 抓取 + 合并 + 聚合(一次运行内多次采样)
+        id: fetch
+        # 采样失败也继续走到提交步骤, 先把已经抓到的数据保住;
+        # 最后由"标记抓取失败"步骤把整次运行显式标红。
+        continue-on-error: true
+        env:
+          SAMPLES: '8'
+          INTERVAL_SECONDS: '1200'
         run: node .github/scripts/fetch-token.js
 
-      - name: 提交数据到仓库
+      - name: 提交数据到仓库(仅在有新数据时)
+        if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add token-data/hourly.json token-data/daily.json
+          if git diff --cached --quiet; then
+            echo "本次没有新数据, 跳过提交"
+            exit 0
+          fi
           git diff --cached --stat
-          git commit -m "auto: token prices $(date -u '+%Y-%m-%d %H:%M UTC')" || echo "no changes"
-          # 防止并发 workflow 推送冲突: 先 rebase 拉取远端最新, 冲突时放弃本地提交(下次运行会补齐)
-          git pull --rebase origin main || { echo "rebase conflict, aborting"; git rebase --abort; exit 0; }
+          git commit -m "auto: token prices $(date -u '+%Y-%m-%d %H:%M UTC')"
+          # 并发写入冲突时如实失败, 不再用 exit 0 把错误伪装成成功
+          git pull --rebase origin main
           git push
+
+      - name: 标记抓取失败
+        if: steps.fetch.outcome == 'failure'
+        run: |
+          echo "抓取步骤存在失败(见上方日志), 本次运行标记为失败"
+          exit 1
