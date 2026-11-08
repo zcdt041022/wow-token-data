@@ -24,8 +24,14 @@ const UA =
 
 const BIN = 20 * 60 * 1000; // 20 分钟一个桶
 const RETAIN_MS = 35 * 24 * 3600 * 1000; // 保留 35 天
-const NOW_MS = Date.now();
-const NOW_SEC = Math.floor(NOW_MS / 1000);
+// 一次运行内会多次采样, 每次采样前用 setNow() 刷新
+let NOW_MS = Date.now();
+let NOW_SEC = Math.floor(NOW_MS / 1000);
+
+function setNow(ms) {
+  NOW_MS = ms;
+  NOW_SEC = Math.floor(ms / 1000);
+}
 
 // ── 第 1 步: 抓取正式服价格 ────────────────────────────────────
 
@@ -228,6 +234,7 @@ function mergeIntoHourly(existing, newPoint, key) {
 
   const labels = data[key].labels.map(String);
   const prices = data[key].prices.slice();
+  let changed = false;
 
   if (newPoint) {
     const bucketMs = Math.floor(newPoint.ts * 1000 / BIN) * BIN;
@@ -236,8 +243,13 @@ function mergeIntoHourly(existing, newPoint, key) {
 
     const idx = labels.indexOf(bucketLabel);
     if (idx >= 0) {
-      prices[idx] = newPoint.price;
-      console.log(`  [${key}] 更新桶 ${bucketLabel} = ${newPoint.price}`);
+      if (prices[idx] !== newPoint.price) {
+        prices[idx] = newPoint.price;
+        changed = true;
+        console.log(`  [${key}] 更新桶 ${bucketLabel} = ${newPoint.price}`);
+      } else {
+        console.log(`  [${key}] 桶 ${bucketLabel} 价格未变 (${newPoint.price}), 不算新数据`);
+      }
     } else {
       // 按时间戳插入
       let insertAt = labels.length;
@@ -249,6 +261,7 @@ function mergeIntoHourly(existing, newPoint, key) {
       }
       labels.splice(insertAt, 0, bucketLabel);
       prices.splice(insertAt, 0, newPoint.price);
+      changed = true;
       console.log(`  [${key}] 新增桶 ${bucketLabel} = ${newPoint.price}`);
     }
   }
@@ -260,14 +273,19 @@ function mergeIntoHourly(existing, newPoint, key) {
     console.log(`  [${key}] 截断: 移除前 ${keepFrom} 条(超过 35 天)`);
     data[key].labels = labels.slice(keepFrom);
     data[key].prices = prices.slice(keepFrom);
+    changed = true;
   } else {
     data[key].labels = labels;
     data[key].prices = prices;
   }
 
   data.granularity = "hourly";
-  data.updated_at = new Date(NOW_MS).toISOString();
-  return data;
+  // 只有真正产生新数据(新桶/价格变化/截断)才动 updated_at,
+  // 否则"没抓到新数据"会被伪装成一次成功更新并产生提交。
+  if (changed) {
+    data.updated_at = new Date(NOW_MS).toISOString();
+  }
+  return { data, changed };
 }
 
 // ── 第 4 步: 从 hourly 聚合出 daily ────────────────────────────
@@ -282,13 +300,14 @@ function mergeIntoHourly(existing, newPoint, key) {
  * }
  * 每天取最后一个价格作为收盘。
  */
-function buildDailyFromHourly(hourly) {
+function buildDailyFromHourly(hourly, existingDaily) {
   const daily = {
     official: { labels: [], prices: [] },
     classic: { labels: [], prices: [] },
     granularity: "daily",
-    updated_at: new Date(NOW_MS).toISOString(),
+    updated_at: "",
   };
+  let changed = false;
 
   for (const key of ["official", "classic"]) {
     if (!hourly[key] || !hourly[key].labels) continue;
@@ -306,15 +325,31 @@ function buildDailyFromHourly(hourly) {
     daily[key].labels = sorted.map(([d]) => String(d));
     daily[key].prices = sorted.map(([, v]) => v.price);
     console.log(`  [daily ${key}] ${sorted.length} 天数据, 最新 ${sorted[sorted.length - 1]?.[1]?.price ?? "无"}`);
+
+    // 与现存 daily 对比, 只在内容真变了才算改动
+    const old = existingDaily?.[key];
+    const same =
+      Array.isArray(old?.labels) &&
+      old.labels.length === daily[key].labels.length &&
+      old.labels.every((l, i) => String(l) === daily[key].labels[i] && old.prices?.[i] === daily[key].prices[i]);
+    if (!same) changed = true;
   }
 
-  return daily;
+  if (changed) {
+    daily.updated_at = new Date(NOW_MS).toISOString();
+  } else if (existingDaily?.updated_at) {
+    daily.updated_at = existingDaily.updated_at;
+  }
+  return { data: daily, changed };
 }
 
 // ── 主流程 ─────────────────────────────────────────────────────
 
-(async () => {
-  console.log(`\n=== 时光徽章定时抓取 ${new Date(NOW_MS).toISOString()} ===\n`);
+// ── 单次采样 ───────────────────────────────────────────────────
+
+async function runOnce() {
+  setNow(Date.now());
+  console.log(`\n=== 时光徽章采样 ${new Date(NOW_MS).toISOString()} ===\n`);
 
   // 1. 先抓 jiguanqiang(同时覆盖正式服+怀旧服两个服, 数据最实时)
   console.log("从 jiguanqiang.net 抓时光徽章价格...");
@@ -334,6 +369,11 @@ function buildDailyFromHourly(hourly) {
     ? { price: jqPrices.classic, ts: NOW_SEC, source: "jiguanqiang" }
     : null;
 
+  if (!officialPoint && !classicPoint) {
+    console.error("  本次采样未抓到任何服务器价格");
+    return { ok: false };
+  }
+
   // 3. 加载现有 hourly.json
   console.log("\n加载现有 hourly.json...");
   const existingHourly = loadJson(HOURLY_PATH);
@@ -348,21 +388,33 @@ function buildDailyFromHourly(hourly) {
   // 4. 合并到 hourly
   console.log("\n合并到 hourly.json...");
   let hourly = existingHourly;
-  hourly = mergeIntoHourly(hourly, officialPoint, "official");
-  hourly = mergeIntoHourly(hourly, classicPoint, "classic");
+  let changed = false;
+  const o = mergeIntoHourly(hourly, officialPoint, "official");
+  hourly = o.data;
+  changed = changed || o.changed;
+  const c = mergeIntoHourly(hourly, classicPoint, "classic");
+  hourly = c.data;
+  changed = changed || c.changed;
 
-  // 4. 从 hourly 聚合 daily
+  // 5. 从 hourly 聚合 daily
   console.log("\n聚合 daily.json...");
-  const daily = buildDailyFromHourly(hourly);
+  const d = buildDailyFromHourly(hourly, existingDaily);
+  changed = changed || d.changed;
 
-  // 5. 写回
+  // 6. 写回: 没产生新数据就不写文件, 让 workflow 的提交步骤自然跳过
   console.log("\n写入文件...");
-  saveJson(HOURLY_PATH, hourly);
-  saveJson(DAILY_PATH, daily);
-  console.log(`  ✅ ${HOURLY_PATH}`);
-  console.log(`  ✅ ${DAILY_PATH}`);
+  if (!changed) {
+    console.log("  本次没有新数据, 不写文件(避免空提交)");
+  } else {
+    saveJson(HOURLY_PATH, hourly);
+    console.log(`  ✅ ${HOURLY_PATH}`);
+    if (d.changed) {
+      saveJson(DAILY_PATH, d.data);
+      console.log(`  ✅ ${DAILY_PATH}`);
+    }
+  }
 
-  // 6. 打印摘要
+  // 7. 打印摘要
   const oLabels = hourly.official?.labels ?? [];
   const oPrices = hourly.official?.prices ?? [];
   const cLabels = hourly.classic?.labels ?? [];
@@ -377,5 +429,46 @@ function buildDailyFromHourly(hourly) {
   console.log(`  怀旧服最新: ${cLatest ?? "无"} (${cLatestLbl ? new Date(Number(cLatestLbl) * 1000).toISOString() : "无"})`);
   console.log(`  怀旧服点数: ${cLabels.length}`);
   console.log(`  总数据量  : ${JSON.stringify(hourly).length} 字节`);
-  console.log(`\n完成!\n`);
-})();
+
+  return { ok: true };
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ── 主流程: 一次运行内按固定间隔多次采样 ────────────────────────
+// GitHub 的 cron 在低活跃仓库上经常被延迟到数小时才触发, 单次采样会让
+// hourly.json 的 20 分钟桶出现大片空洞。这里让一次运行持续约 2.5 小时
+// (默认 8 次 × 20 分钟), 配合 workflow 的 concurrency 串行, 把缺口压到最小。
+// 采样次数/间隔可用环境变量 SAMPLES / INTERVAL_SECONDS 调整。
+(async () => {
+  const samples = Math.max(1, parseInt(process.env.SAMPLES || "8", 10));
+  const intervalSec = Math.max(60, parseInt(process.env.INTERVAL_SECONDS || "1200", 10));
+  console.log(`一次运行内采样 ${samples} 次, 间隔 ${intervalSec} 秒`);
+
+  let okCount = 0;
+  let failCount = 0;
+  for (let i = 0; i < samples; i++) {
+    console.log(`\n--- 采样 ${i + 1}/${samples} ---`);
+    const r = await runOnce();
+    if (r.ok) okCount++;
+    else failCount++;
+    if (i < samples - 1) {
+      console.log(`等待 ${intervalSec} 秒后进行下一次采样...`);
+      await sleep(intervalSec * 1000);
+    }
+  }
+
+  console.log(`\n=== 采样汇总: 成功 ${okCount}, 失败 ${failCount}, 共 ${samples} ===`);
+  // 任何一次采样没抓到数据都以非 0 退出, 让 Actions 显示为失败,
+  // 不再用 echo 之类把失败伪装成成功。
+  if (failCount > 0) {
+    console.error(`存在 ${failCount} 次采样未抓到数据, 本次运行标记为失败`);
+    process.exit(1);
+  }
+  console.log("全部采样完成\n");
+})().catch((e) => {
+  console.error(`未捕获异常: ${e && e.stack ? e.stack : e}`);
+  process.exit(1);
+});
