@@ -26,31 +26,34 @@ jobs:
         with:
           node-version: '20'
 
-      - name: 抓取 + 合并 + 聚合(一次运行内多次采样)
+      - name: 抓取 + 每轮提交(一次运行内多次采样)
         id: fetch
-        # 采样失败也继续走到提交步骤, 先把已经抓到的数据保住;
+        # 采样失败也继续, 已采到的数据在采样循环内就已逐轮提交;
         # 最后由"标记抓取失败"步骤把整次运行显式标红。
         continue-on-error: true
         env:
           SAMPLES: '8'
           INTERVAL_SECONDS: '1200'
+          # 让脚本在每轮采样后自行 commit + push(失败会留在本地并在下轮重试)
+          AUTO_COMMIT: '1'
         run: node .github/scripts/fetch-token.js
 
-      - name: 提交数据到仓库(仅在有新数据时)
+      - name: 兜底提交(脚本提前退出时的剩余数据)
         if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add token-data/hourly.json token-data/daily.json
           if git diff --cached --quiet; then
-            echo "本次没有新数据, 跳过提交"
+            echo "没有待提交数据(正常情况下已由采样循环逐轮提交)"
             exit 0
           fi
           git diff --cached --stat
-          git commit -m "auto: token prices $(date -u '+%Y-%m-%d %H:%M UTC')"
-          # 并发写入冲突时如实失败, 不再用 exit 0 把错误伪装成成功
-          git pull --rebase origin main
-          git push
+          git commit -m "auto: token fallback $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          # 并发写入冲突时如实失败, 不用 exit 0 把错误伪装成成功
+          git fetch origin main
+          git rebase origin/main || { git rebase --abort; echo "rebase 失败"; exit 1; }
+          git push origin HEAD:main
 
       - name: 标记抓取失败
         if: steps.fetch.outcome == 'failure'
