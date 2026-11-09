@@ -1,15 +1,17 @@
 name: 时光徽章价格定时抓取
 
 on:
-  # 每 30 分钟触发一次。GitHub 的 schedule 在低活跃仓库上常被延迟
+  # 每 15 分钟触发一次。GitHub 的 schedule 在低活跃仓库上常被延迟
   # (实测中位数约 3.5 小时), 因此补缺密度主要靠"单次运行内多次采样 +
-  # concurrency 串行"来兜底, 而不是指望 cron 准点。
+  # concurrency 串行"来兜底: 一次运行长达约 5 小时, 期间一直有排队运行,
+  # 上一轮结束后排队的运行会立刻接上, 不依赖 cron 准点触发。
   schedule:
-    - cron: '*/30 * * * *'
+    - cron: '*/15 * * * *'
   # 允许手动触发测试
   workflow_dispatch:
 
-# 同一时间只保留一个运行: 新触发的运行排队等待, 不打断正在进行的多采样运行。
+# 同一时间只保留一个运行: 新触发的运行排队等待(自动替换更早的排队运行),
+# 不打断正在进行的多采样运行, 从而把相邻运行的 20 分钟桶首尾接起来。
 concurrency:
   group: token-fetch
   cancel-in-progress: false
@@ -17,8 +19,9 @@ concurrency:
 jobs:
   fetch:
     runs-on: ubuntu-latest
-    # 8 次采样 × 20 分钟 ≈ 140 分钟, 留出网络与提交余量
-    timeout-minutes: 180
+    # 16 次采样 × 20 分钟 = 300 分钟采样跨度; 350 分钟给 checkout/setup/
+    # 每轮提交/网络重试留约 50 分钟余量, 不把超时压到刚好盖住采样总时长。
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
 
@@ -32,7 +35,7 @@ jobs:
         # 最后由"标记抓取失败"步骤把整次运行显式标红。
         continue-on-error: true
         env:
-          SAMPLES: '8'
+          SAMPLES: '16'
           INTERVAL_SECONDS: '1200'
           # 让脚本在每轮采样后自行 commit + push(失败会留在本地并在下轮重试)
           AUTO_COMMIT: '1'
