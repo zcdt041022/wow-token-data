@@ -265,7 +265,7 @@ function commitAndPush(sampleIdx, total) {
   }
   let committed = false;
   if (staged.code === 1) {
-    // 提交信息带采样序号与时间, 8 轮最多 8 条, 便于回溯
+    // 提交信息带采样序号与时间, 每轮采样最多一条, 便于回溯
     const msg = `auto: token sample ${sampleIdx}/${total} @ ${new Date().toISOString()}`;
     const c = git(["commit", "-m", msg]);
     if (!c.ok) {
@@ -532,8 +532,11 @@ function sleep(ms) {
 
 // ── 主流程: 一次运行内按固定间隔多次采样 ────────────────────────
 // GitHub 的 cron 在低活跃仓库上经常被延迟到数小时才触发, 单次采样会让
-// hourly.json 的 20 分钟桶出现大片空洞。这里让一次运行持续约 2.5 小时
-// (默认 8 次 × 20 分钟), 配合 workflow 的 concurrency 串行, 把缺口压到最小。
+// hourly.json 的 20 分钟桶出现大片空洞。这里让一次运行持续约 5 小时
+// (默认 16 次 × 20 分钟), 配合 workflow 的 concurrency 串行, 上一轮结束后
+// 排队的下一轮会立刻接上, 把缺口压到最小。
+// 采样起点严格按固定间隔排布(而不是"抓完再睡 20 分钟"), 否则每轮的网络
+// 耗时会让采样点持续后移, 累计漂移足以整桶跳过 20 分钟桶。
 // 每轮采样结束立即提交并推送(见 commitAndPush), 不必等整轮跑完才落盘。
 // 采样次数/间隔可用环境变量 SAMPLES / INTERVAL_SECONDS 调整。
 (async () => {
@@ -545,17 +548,25 @@ function sleep(ms) {
   let failCount = 0;
   let commitFailCount = 0;
   for (let i = 0; i < samples; i++) {
+    const sampleStartedAt = Date.now();
     console.log(`\n--- 采样 ${i + 1}/${samples} ---`);
     const r = await runOnce();
     if (r.ok) okCount++;
     else failCount++;
     // 每轮采样后立即提交(失败轮次也会重试上次没推上去的提交),
-    // 让 20 分钟桶在 140 分钟的运行过程中就能被仓库/桌面端读到。
+    // 让 20 分钟桶在约 5 小时的运行过程中就能被仓库/桌面端读到。
     const cm = commitAndPush(i + 1, samples);
     if (!cm.ok) commitFailCount++;
     if (i < samples - 1) {
-      console.log(`等待 ${intervalSec} 秒后进行下一次采样...`);
-      await sleep(intervalSec * 1000);
+      // 以本轮采样起点为基准计算等待时间: 保证相邻采样起点正好相隔
+      // intervalSec, 网络耗时不会逐轮累积成漂移。
+      const waitMs = sampleStartedAt + intervalSec * 1000 - Date.now();
+      if (waitMs > 0) {
+        console.log(`等待 ${Math.round(waitMs / 1000)} 秒后进行下一次采样...`);
+        await sleep(waitMs);
+      } else {
+        console.log("本轮采样耗时超过间隔, 立即开始下一次采样");
+      }
     }
   }
 
