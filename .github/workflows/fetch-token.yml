@@ -41,22 +41,23 @@ jobs:
           AUTO_COMMIT: '1'
         run: node .github/scripts/fetch-token.js
 
-      - name: 兜底提交(脚本提前退出时的剩余数据)
+      - name: 兜底检查(脚本异常退出时的残留)
+        # 只诊断, 不提交、不推送。
+        # 提交/推送完全由脚本负责(fetch → reset --hard → 重新合并 → commit → push);
+        # 这里若也用 commit + rebase, 会和其它 run 的同一个生成文件产生文本冲突,
+        # 正是之前 16/16 推送全部失败的原因。残留数据由下一轮重新抓取覆盖。
         if: always()
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
           git add token-data/hourly.json token-data/daily.json
           if git diff --cached --quiet; then
-            echo "没有待提交数据(正常情况下已由采样循环逐轮提交)"
-            exit 0
+            echo "无残留未提交数据"
+          else
+            git diff --cached --stat
+            echo "::warning::存在未提交的数据(脚本异常退出), 本轮不上传, 下一轮重新抓取"
           fi
-          git diff --cached --stat
-          git commit -m "auto: token fallback $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-          # 并发写入冲突时如实失败, 不用 exit 0 把错误伪装成成功
-          git fetch origin main
-          git rebase origin/main || { git rebase --abort; echo "rebase 失败"; exit 1; }
-          git push origin HEAD:main
+          if git rev-parse --verify origin/main >/dev/null 2>&1; then
+            echo "未推送的本地提交: $(git rev-list --count origin/main..HEAD)"
+          fi
 
       - name: 标记抓取失败
         if: steps.fetch.outcome == 'failure'
