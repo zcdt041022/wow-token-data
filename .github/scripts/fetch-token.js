@@ -2,11 +2,9 @@
  * 时光徽章价格定时抓取脚本 (GitHub Actions)
  * ----------------------------------------------------------------------------
    数据源:
-     正式服(official):
-       1. chuanghan.top JSON API (优先, 干净 JSON)
-       2. wowdata.top HTML (备用, 解析价格)
-     怀旧服(classic):
-       暂不抓取(依赖本地软件从 jiguanqiang.net 获取), 保留已有数据
+     jiguanqiang.net 首页 — 正式服 + 怀旧服(优先, 最实时)
+     正式服兜底: wowdata.top HTML (解析价格)
+     (chuanghan.top 已停止服务, 其 JSON API 分支已从脚本移除)
 
    输出:
      token-data/hourly.json  — 20 分钟粒度, 保留最近 35 天
@@ -37,34 +35,8 @@ function setNow(ms) {
 // ── 第 1 步: 抓取正式服价格 ────────────────────────────────────
 
 async function fetchOfficial() {
-  const results = [];
-
-  // 源 1: chuanghan.top JSON API
-  try {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 10000);
-    const res = await fetch("https://chuanghan.top/api/token/summary", {
-      headers: { "User-Agent": UA },
-      signal: ctrl.signal,
-    });
-    clearTimeout(timer);
-    if (res.ok) {
-      const j = await res.json();
-      if (j && j.latest_price && j.latest_price > 100000) {
-        // API 返回的是 6297290000, 实际价格是 ÷10000 = 629729
-        const price = Math.round(j.latest_price / 10000);
-        const ts = j.latest_time || NOW_SEC;
-        console.log(
-          `  [chuanghan] 正式服 price=${price} ts=${ts} (${new Date(ts * 1000).toISOString()})`,
-        );
-        results.push({ price, ts: Number(ts), source: "chuanghan" });
-      }
-    }
-  } catch (e) {
-    console.log(`  [chuanghan] 失败: ${e.message}`);
-  }
-
-  // 源 2: wowdata.top HTML (备用)
+  // 唯一的正式服兜底源(仅当 jiguanqiang 首页没抓到正式服时才走这里)。
+  // chuanghan.top 已停止服务, 其 JSON API 分支已移除。
   try {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 10000);
@@ -81,32 +53,20 @@ async function fetchOfficial() {
         const price = parseInt(m[1] + m[2], 10);
         if (price > 100000) {
           console.log(`  [wowdata] 正式服 price=${price} ts=${NOW_SEC}`);
-          results.push({ price, ts: NOW_SEC, source: "wowdata" });
+          return { price, ts: NOW_SEC, source: "wowdata" };
         }
+        console.log(`  [wowdata] 价格异常(${price}), 忽略`);
+      } else {
+        console.log("  [wowdata] 页面未匹配到价格");
       }
+    } else {
+      console.log(`  [wowdata] HTTP ${res.status}`);
     }
   } catch (e) {
     console.log(`  [wowdata] 失败: ${e.message}`);
   }
-
-  if (results.length === 0) {
-    console.log("  ⚠️ 所有正式服数据源均失败");
-    return null;
-  }
-
-  // 固定优先级: wowdata > chuanghan
-  // 理由: chuanghan.top 是插件收集数据, 有约 40 分钟滞后; 它的 latest_time
-  //       字段是 API 响应时间而非数据时间, 不能用 ts 排序判断新鲜度。
-  //       wowdata.top 接近实时, 与官方价格一致, 应优先采用。
-  const PRIORITY = ["wowdata", "chuanghan"];
-  for (const src of PRIORITY) {
-    const hit = results.find((r) => r.source === src);
-    if (hit) {
-      console.log(`  [selected] 正式服 选用 ${src} price=${hit.price}`);
-      return hit;
-    }
-  }
-  return results[0];
+  console.log("  ⚠️ 正式服兜底源未取到价格");
+  return null;
 }
 
 // ── 第 1b 步: 从 jiguanqiang.net 同时抓正式服 + 怀旧服价格 ──────
@@ -213,22 +173,41 @@ function saveJson(filepath, data) {
 }
 
 // ── 每轮采样后立即提交 ──────────────────────────────────────────
-// 一次运行要持续约 140 分钟, 若等到整轮结束才提交, 这 140 分钟内
-// 仓库和桌面端都读不到任何新数据。因此每完成一次采样就提交一次,
-// 让 20 分钟桶"边采边落"; 提交失败不吞掉, 由主循环计入失败次数。
+// 一次运行要持续约 5 小时, 若等到整轮结束才提交, 这段时间内
+// 仓库和桌面端都读不到任何新数据。因此每完成一次采样就同步一次。
+//
+// ⚠️ 关键设计: hourly.json / daily.json 是纯生成文件, 远端随时有其它 run
+// 在推同一个文件。若沿用 "本地 commit → fetch → rebase origin/main",
+// 两边都改同一文件的同一区域, rebase 必然文本冲突; 冲突后 abort 会把旧
+// commit 留在分支上, 下一轮再 commit 再 rebase, 要重放的还是那个旧 commit,
+// 于是永久失败(实测一次 run 内 16/16 全部失败, 一条数据都没进仓库)。
+//
+// 现在的做法是"重新生成"而不是"文本合并":
+//   1. git fetch origin main
+//   2. git reset --hard origin/main  (丢弃本地失效 commit, 工作区对齐远端最新)
+//   3. 在远端最新内容之上, 把本轮 + 之前积压的全部采样点重新合并进
+//      hourly.json, 并由 hourly 重新聚合 daily.json
+//   4. git add → commit → push
+// 第 2 步不会丢掉别人刚写入的数据: 第 3 步的合并基线正是刚 reset 下来的
+// 远端文件, 别人的桶原样保留, 只在其上追加本轮的桶。
+// 推送被拒等极端竞态时整轮重来, 但每次重试前都会 reset 丢弃上一次的失效
+// commit, 且有硬上限, 不会在分支上无限累积失败提交。
 // 仅在 Actions 中生效(AUTO_COMMIT=1), 本地直接跑脚本不会碰 git。
 
 const AUTO_COMMIT = process.env.AUTO_COMMIT === "1";
+/** 单轮同步的硬重试上限: 超过就如实失败(不累积失败 commit)。 */
+const MAX_PUSH_ATTEMPTS = 3;
 let gitIdentityReady = false;
-// 上一轮提交没能推上去时置 true, 下一轮即使没有新数据也会重试推送
-let pendingPush = false;
+/** 待推送的采样点(跨轮次累积, 推送成功后清空)。 */
+const pendingPoints = [];
 
 function git(args) {
   const r = spawnSync("git", args, { encoding: "utf-8" });
   return {
     ok: r.status === 0,
     code: r.status,
-    err: (r.stderr || "").trim(),
+    // 失败原因优先取 stderr(push 被拒等提示都在这里), 没有则退回 stdout
+    err: (r.stderr || "").trim() || (r.stdout || "").trim(),
   };
 }
 
@@ -240,68 +219,173 @@ function ensureIdentity() {
 }
 
 /**
- * 提交本轮到手的部分并推送。
- * 返回 { ok, committed }: ok=false 表示提交/同步/推送失败(已在日志里说明原因),
- * 主循环据此把整次运行标红; 失败的提交会留在本地, 下一轮自动补推。
+ * 把待推送的采样点合并进"当前工作区"的 hourly.json, 并重新聚合 daily.json。
+ * 调用前工作区必须已对齐远端最新(reset --hard origin/main), 这样合并基线
+ * 就是远端内容, 不会把别人这期间写入的桶冲掉。
+ * 返回 { changed } — 没有任何新数据(同桶同价)时返回 false, 不产生提交。
  */
-function commitAndPush(sampleIdx, total) {
+function mergeAndWrite(points) {
+  console.log("\n加载当前 hourly.json...");
+  const existingHourly = loadJson(HOURLY_PATH);
+  const existingDaily = loadJson(DAILY_PATH);
+  if (existingHourly) {
+    console.log(`  official: ${existingHourly.official?.labels?.length ?? 0} 点`);
+    console.log(`  classic : ${existingHourly.classic?.labels?.length ?? 0} 点`);
+  } else {
+    console.log("  hourly.json 不存在, 将创建新文件");
+  }
+
+  console.log("\n合并到 hourly.json...");
+  let hourly = existingHourly;
+  let changed = false;
+  for (const { key, point } of points) {
+    if (!point) continue;
+    const m = mergeIntoHourly(hourly, point, key);
+    hourly = m.data;
+    changed = changed || m.changed;
+  }
+
+  console.log("\n聚合 daily.json...");
+  const d = buildDailyFromHourly(hourly, existingDaily);
+  changed = changed || d.changed;
+
+  console.log("\n写入文件...");
+  if (!changed) {
+    console.log("  本次没有新数据, 不写文件(避免空提交)");
+    return { changed: false };
+  }
+  saveJson(HOURLY_PATH, hourly);
+  console.log(`  ✅ ${HOURLY_PATH}`);
+  if (d.changed) {
+    saveJson(DAILY_PATH, d.data);
+    console.log(`  ✅ ${DAILY_PATH}`);
+  }
+
+  const oLabels = hourly.official?.labels ?? [];
+  const oPrices = hourly.official?.prices ?? [];
+  const cLabels = hourly.classic?.labels ?? [];
+  const cPrices = hourly.classic?.prices ?? [];
+  const oLatest = oPrices[oPrices.length - 1];
+  const cLatest = cPrices[cPrices.length - 1];
+  const oLatestLbl = oLabels[oLabels.length - 1];
+  const cLatestLbl = cLabels[cLabels.length - 1];
+  console.log(`\n=== 摘要 ===`);
+  console.log(`  正式服最新: ${oLatest} (${oLatestLbl ? new Date(Number(oLatestLbl) * 1000).toISOString() : "无"})`);
+  console.log(`  正式服点数: ${oLabels.length}`);
+  console.log(`  怀旧服最新: ${cLatest ?? "无"} (${cLatestLbl ? new Date(Number(cLatestLbl) * 1000).toISOString() : "无"})`);
+  console.log(`  怀旧服点数: ${cLabels.length}`);
+  console.log(`  总数据量  : ${JSON.stringify(hourly).length} 字节`);
+
+  return { changed: true };
+}
+
+/**
+ * 把待推送的采样点同步到 origin/main:
+ *   fetch → reset --hard origin/main → 重新合并(本轮+积压) → add → commit → push
+ * 每次尝试前都会 reset 到远端最新, 因此本地不会残留失效 commit;
+ * 推送成功后一次性推上所有积压采样点(不是只推一个点)。
+ * 返回 { ok, committed }; ok=false 时 pendingPoints 保留在内存, 下一轮再推。
+ */
+function syncAndPush(sampleIdx, total) {
   if (!AUTO_COMMIT) {
-    console.log("  [commit] 未设置 AUTO_COMMIT=1, 跳过提交(视为本地运行)");
+    console.log("  [sync] 未设置 AUTO_COMMIT=1, 跳过同步(视为本地运行)");
+    return { ok: true, committed: false };
+  }
+  if (pendingPoints.length === 0) {
+    console.log("  [sync] 没有待推送的采样点");
     return { ok: true, committed: false };
   }
   ensureIdentity();
 
-  const add = git(["add", "token-data/hourly.json", "token-data/daily.json"]);
-  if (!add.ok) {
-    console.error(`  [commit] git add 失败: ${add.err}`);
-    return { ok: false, committed: false };
-  }
+  let lastStage = "unknown";
+  let lastReason = "未知原因";
+  for (let attempt = 1; attempt <= MAX_PUSH_ATTEMPTS; attempt++) {
+    console.log(`  [sync] 第 ${attempt}/${MAX_PUSH_ATTEMPTS} 次同步尝试(待推 ${pendingPoints.length} 点)`);
 
-  // git diff --cached --quiet: 退出码 0 = 没有暂存改动, 1 = 有改动
-  const staged = git(["diff", "--cached", "--quiet"]);
-  if (staged.code !== 0 && staged.code !== 1) {
-    console.error(`  [commit] git diff 异常退出(${staged.code}): ${staged.err}`);
-    return { ok: false, committed: false };
-  }
-  let committed = false;
-  if (staged.code === 1) {
-    // 提交信息带采样序号与时间, 每轮采样最多一条, 便于回溯
-    const msg = `auto: token sample ${sampleIdx}/${total} @ ${new Date().toISOString()}`;
-    const c = git(["commit", "-m", msg]);
-    if (!c.ok) {
-      console.error(`  [commit] git commit 失败: ${c.err}`);
-      return { ok: false, committed: false };
+    // 1. 取远端最新
+    const fetched = git(["fetch", "origin", "main"]);
+    if (!fetched.ok) {
+      lastStage = "fetch";
+      lastReason = fetched.err || `退出码 ${fetched.code}`;
+      console.error(`  [sync] ✗ fetch 失败: ${lastReason}`);
+      continue;
     }
-    committed = true;
-    console.log(`  [commit] ✅ 已提交: ${msg}`);
-  } else if (!pendingPush) {
-    console.log("  [commit] 本轮无新数据, 不提交");
-    return { ok: true, committed: false };
+
+    // 2. 丢弃本地失效 commit, 工作区对齐远端最新(数据还在 pendingPoints 里)
+    const reset = git(["reset", "--hard", "origin/main"]);
+    if (!reset.ok) {
+      lastStage = "reset";
+      lastReason = reset.err || `退出码 ${reset.code}`;
+      console.error(`  [sync] ✗ reset --hard origin/main 失败: ${lastReason}`);
+      continue;
+    }
+
+    // 3. 在远端最新内容之上重新合并(重新生成而非文本合并, 不会冲突)
+    let mw;
+    try {
+      mw = mergeAndWrite(pendingPoints);
+    } catch (e) {
+      lastStage = "merge";
+      lastReason = e && e.message ? e.message : String(e);
+      console.error(`  [sync] ✗ 合并/写文件失败: ${lastReason}`);
+      continue;
+    }
+    if (!mw.changed) {
+      console.log("  [sync] 远端已包含这些桶且价格一致, 无需推送");
+      pendingPoints.length = 0;
+      return { ok: true, committed: false };
+    }
+
+    // 4. 提交
+    const added = git(["add", "token-data/hourly.json", "token-data/daily.json"]);
+    if (!added.ok) {
+      lastStage = "add";
+      lastReason = added.err || `退出码 ${added.code}`;
+      console.error(`  [sync] ✗ git add 失败: ${lastReason}`);
+      continue;
+    }
+    const msg = `auto: token ${pendingPoints.length} 点 (sample ${sampleIdx}/${total}) @ ${new Date().toISOString()}`;
+    // 兜一层: 极端情况下重算后的内容与远端逐字节相同, 不要在这里 commit 失败
+    const staged = git(["diff", "--cached", "--quiet"]);
+    if (staged.code === 0) {
+      console.log("  [sync] 重算结果与远端一致(无实际改动), 无需推送");
+      pendingPoints.length = 0;
+      return { ok: true, committed: false };
+    }
+    if (staged.code !== 1) {
+      lastStage = "diff";
+      lastReason = staged.err || `退出码 ${staged.code}`;
+      console.error(`  [sync] ✗ git diff --cached 异常: ${lastReason}`);
+      continue;
+    }
+    const made = git(["commit", "-m", msg]);
+    if (!made.ok) {
+      lastStage = "commit";
+      lastReason = made.err || `退出码 ${made.code}`;
+      console.error(`  [sync] ✗ git commit 失败: ${lastReason}`);
+      continue;
+    }
+    console.log(`  [sync] ✅ 已提交: ${msg}`);
+
+    // 5. 推送
+    const pushed = git(["push", "origin", "HEAD:main"]);
+    if (!pushed.ok) {
+      lastStage = "push";
+      lastReason = pushed.err || `退出码 ${pushed.code}`;
+      console.error(`  [sync] ✗ push 被拒/失败: ${lastReason}`);
+      continue; // 下一次尝试会 fetch + reset, 丢弃这个已失效的 commit
+    }
+
+    pendingPoints.length = 0;
+    console.log("  [sync] ✅ 已推送到 origin/main");
+    return { ok: true, committed: true };
   }
 
-  // 用 fetch + rebase 而不是 pull, 在 detached HEAD 下同样可用
-  const fetched = git(["fetch", "origin", "main"]);
-  if (!fetched.ok) {
-    console.error(`  [commit] git fetch 失败: ${fetched.err}; 提交留在本地, 下一轮重试`);
-    pendingPush = true;
-    return { ok: false, committed };
-  }
-  const rebased = git(["rebase", "origin/main"]);
-  if (!rebased.ok) {
-    git(["rebase", "--abort"]);
-    console.error(`  [commit] rebase 失败: ${rebased.err}; 已回滚, 提交留在本地, 下一轮重试`);
-    pendingPush = true;
-    return { ok: false, committed };
-  }
-  const pushed = git(["push", "origin", "HEAD:main"]);
-  if (!pushed.ok) {
-    console.error(`  [commit] git push 失败: ${pushed.err}; 提交留在本地, 下一轮重试`);
-    pendingPush = true;
-    return { ok: false, committed };
-  }
-  pendingPush = false;
-  console.log("  [commit] ✅ 已推送到 origin/main");
-  return { ok: true, committed };
+  console.error(
+    `  [sync] ✗ 第 ${sampleIdx}/${total} 轮同步失败(阶段=${lastStage}, 已尝试 ${MAX_PUSH_ATTEMPTS} 次): ${lastReason}`,
+  );
+  console.error("  [sync] 采样点保留在内存, 下一轮采样时一并重推");
+  return { ok: false, committed: false };
 }
 
 // ── 第 3 步: 合并价格到 hourly.json ────────────────────────────
@@ -448,13 +532,13 @@ async function runOnce() {
   console.log("从 jiguanqiang.net 抓时光徽章价格...");
   const jqPrices = await fetchJqSnapshot();
 
-  // 2. 抓正式服备用(chuanghan / wowdata, jiguanqiang 已有则跳过)
+  // 2. 抓正式服兜底(wowdata), jiguanqiang 已有则跳过
   let officialPoint = null;
   if (jqPrices.official) {
-    console.log(`  jiguanqiang 已有正式服 ${jqPrices.official}, 跳过 chuanghan/wowdata`);
+    console.log(`  jiguanqiang 已有正式服 ${jqPrices.official}, 跳过 wowdata 兜底`);
     officialPoint = { price: jqPrices.official, ts: NOW_SEC, source: "jiguanqiang" };
   } else {
-    console.log("  jiguanqiang 未抓到正式服, 回退 chuanghan/wowdata...");
+    console.log("  jiguanqiang 未抓到正式服, 回退 wowdata...");
     officialPoint = await fetchOfficial();
   }
 
@@ -464,66 +548,18 @@ async function runOnce() {
 
   if (!officialPoint && !classicPoint) {
     console.error("  本次采样未抓到任何服务器价格");
-    return { ok: false };
+    return { ok: false, points: [] };
   }
 
-  // 3. 加载现有 hourly.json
-  console.log("\n加载现有 hourly.json...");
-  const existingHourly = loadJson(HOURLY_PATH);
-  const existingDaily = loadJson(DAILY_PATH);
-  if (existingHourly) {
-    console.log(`  official: ${existingHourly.official?.labels?.length ?? 0} 点`);
-    console.log(`  classic : ${existingHourly.classic?.labels?.length ?? 0} 点`);
-  } else {
-    console.log("  hourly.json 不存在, 将创建新文件");
-  }
-
-  // 4. 合并到 hourly
-  console.log("\n合并到 hourly.json...");
-  let hourly = existingHourly;
-  let changed = false;
-  const o = mergeIntoHourly(hourly, officialPoint, "official");
-  hourly = o.data;
-  changed = changed || o.changed;
-  const c = mergeIntoHourly(hourly, classicPoint, "classic");
-  hourly = c.data;
-  changed = changed || c.changed;
-
-  // 5. 从 hourly 聚合 daily
-  console.log("\n聚合 daily.json...");
-  const d = buildDailyFromHourly(hourly, existingDaily);
-  changed = changed || d.changed;
-
-  // 6. 写回: 没产生新数据就不写文件, 让 workflow 的提交步骤自然跳过
-  console.log("\n写入文件...");
-  if (!changed) {
-    console.log("  本次没有新数据, 不写文件(避免空提交)");
-  } else {
-    saveJson(HOURLY_PATH, hourly);
-    console.log(`  ✅ ${HOURLY_PATH}`);
-    if (d.changed) {
-      saveJson(DAILY_PATH, d.data);
-      console.log(`  ✅ ${DAILY_PATH}`);
-    }
-  }
-
-  // 7. 打印摘要
-  const oLabels = hourly.official?.labels ?? [];
-  const oPrices = hourly.official?.prices ?? [];
-  const cLabels = hourly.classic?.labels ?? [];
-  const cPrices = hourly.classic?.prices ?? [];
-  const oLatest = oPrices[oPrices.length - 1];
-  const cLatest = cPrices[cPrices.length - 1];
-  const oLatestLbl = oLabels[oLabels.length - 1];
-  const cLatestLbl = cLabels[cLabels.length - 1];
-  console.log(`\n=== 摘要 ===`);
-  console.log(`  正式服最新: ${oLatest} (${oLatestLbl ? new Date(Number(oLatestLbl) * 1000).toISOString() : "无"})`);
-  console.log(`  正式服点数: ${oLabels.length}`);
-  console.log(`  怀旧服最新: ${cLatest ?? "无"} (${cLatestLbl ? new Date(Number(cLatestLbl) * 1000).toISOString() : "无"})`);
-  console.log(`  怀旧服点数: ${cLabels.length}`);
-  console.log(`  总数据量  : ${JSON.stringify(hourly).length} 字节`);
-
-  return { ok: true };
+  // 只负责抓取, 不落盘: 合并写入统一由 mergeAndWrite(在最新远端内容之上)
+  // 执行, 避免"本地旧文件 → 提交 → 与远端冲突"的老问题。
+  const points = [];
+  if (officialPoint) points.push({ key: "official", point: officialPoint });
+  if (classicPoint) points.push({ key: "classic", point: classicPoint });
+  console.log(
+    `  本轮抓取: ${points.map((p) => `${p.key}=${p.point.price}(${p.point.source})`).join(", ")}`,
+  );
+  return { ok: true, points };
 }
 
 function sleep(ms) {
@@ -537,7 +573,7 @@ function sleep(ms) {
 // 排队的下一轮会立刻接上, 把缺口压到最小。
 // 采样起点严格按固定间隔排布(而不是"抓完再睡 20 分钟"), 否则每轮的网络
 // 耗时会让采样点持续后移, 累计漂移足以整桶跳过 20 分钟桶。
-// 每轮采样结束立即提交并推送(见 commitAndPush), 不必等整轮跑完才落盘。
+// 每轮采样结束立即同步到远端(见 syncAndPush), 不必等整轮跑完才落盘。
 // 采样次数/间隔可用环境变量 SAMPLES / INTERVAL_SECONDS 调整。
 (async () => {
   const samples = Math.max(1, parseInt(process.env.SAMPLES || "8", 10));
@@ -546,17 +582,26 @@ function sleep(ms) {
 
   let okCount = 0;
   let failCount = 0;
-  let commitFailCount = 0;
+  let syncFailCount = 0;
   for (let i = 0; i < samples; i++) {
     const sampleStartedAt = Date.now();
     console.log(`\n--- 采样 ${i + 1}/${samples} ---`);
     const r = await runOnce();
-    if (r.ok) okCount++;
-    else failCount++;
-    // 每轮采样后立即提交(失败轮次也会重试上次没推上去的提交),
-    // 让 20 分钟桶在约 5 小时的运行过程中就能被仓库/桌面端读到。
-    const cm = commitAndPush(i + 1, samples);
-    if (!cm.ok) commitFailCount++;
+    if (r.ok) {
+      okCount++;
+      if (AUTO_COMMIT) pendingPoints.push(...r.points);
+    } else {
+      failCount++;
+    }
+    // 每轮采样后立即同步: 拉最新远端 → 在其上重新合并本轮+积压的全部采样点
+    // → 提交 → 推送。同步失败时采样点留在内存, 下一轮一并重推。
+    if (AUTO_COMMIT) {
+      const cm = syncAndPush(i + 1, samples);
+      if (!cm.ok) syncFailCount++;
+    } else if (r.points.length) {
+      // 本地运行: 直接合并写盘, 不碰 git
+      mergeAndWrite(r.points);
+    }
     if (i < samples - 1) {
       // 以本轮采样起点为基准计算等待时间: 保证相邻采样起点正好相隔
       // intervalSec, 网络耗时不会逐轮累积成漂移。
@@ -571,13 +616,16 @@ function sleep(ms) {
   }
 
   console.log(
-    `\n=== 采样汇总: 成功 ${okCount}, 失败 ${failCount}, 提交/推送失败 ${commitFailCount}, 共 ${samples} ===`,
+    `\n=== 采样汇总: 成功 ${okCount}, 失败 ${failCount}, 同步失败 ${syncFailCount}, 共 ${samples} ===`,
   );
-  // 任何一次采样没抓到数据、或任何一次提交/推送失败, 都以非 0 退出,
+  if (pendingPoints.length > 0) {
+    console.log(`尚有 ${pendingPoints.length} 个采样点未推送(将被本次运行丢弃, 下一轮重新抓取)`);
+  }
+  // 任何一次采样没抓到数据、或任何一次同步失败, 都以非 0 退出,
   // 让 Actions 显示为失败, 不把失败伪装成成功。
-  if (failCount > 0 || commitFailCount > 0) {
+  if (failCount > 0 || syncFailCount > 0) {
     console.error(
-      `存在 ${failCount} 次采样未抓到数据, ${commitFailCount} 次提交/推送失败, 本次运行标记为失败`,
+      `存在 ${failCount} 次采样未抓到数据, ${syncFailCount} 次同步失败, 本次运行标记为失败`,
     );
     process.exit(1);
   }
